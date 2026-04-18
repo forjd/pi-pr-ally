@@ -67,6 +67,7 @@ Then start pi inside a GitHub repo with an open PR on the current branch and try
 
 - `/pr`
 - `/checks`
+- `/check-log "typecheck"`
 - `/review-comments`
 - `/pr-mode status`
 
@@ -84,6 +85,7 @@ You can also just ask pi in plain English:
 | `/pr` | Show the current PR summary |
 | `/checks` | Show the current PR checks |
 | `/review-comments` | Show recent PR review comments |
+| `/check-log <check name or run id>` | Fetch a GitHub Actions job log by check name, or a workflow log by run ID |
 | `/pr-refresh` | Refresh PR, checks, and review data from GitHub |
 | `/pr-mode on|off|status` | Enable, disable, or inspect automatic PR context injection |
 
@@ -94,7 +96,7 @@ You can also just ask pi in plain English:
 | `pr_context` | Return the current PR summary for the repo in the current working directory |
 | `pr_checks` | Return PR checks, with an option to show only failing checks |
 | `pr_review_comments` | Return recent PR review comments |
-| `pr_check_log` | Fetch workflow logs by `runId` or workflow name |
+| `pr_check_log` | Fetch workflow or job logs by `checkName`, `jobId`, `runId`, or workflow name |
 
 `pr_check_log` truncates output to pi's default chat limits. When a log is longer, the full text is written to a temporary file and the path is returned in the tool details.
 
@@ -131,7 +133,7 @@ If the extension is not showing PR data, check the basics first:
 
 ## Roadmap
 
-- Better mapping from failing checks to workflow and job logs
+- Better mapping from failing checks to individual failed steps
 - Unresolved review thread support via GraphQL
 - Richer TUI widgets and footer status
 - GitLab support

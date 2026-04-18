@@ -6,6 +6,7 @@ import {
   getCurrentPr,
   getRepoSlugFromGh,
   getReviewComments,
+  getWorkflowRuns,
   hasGhCli,
   validateGhAccess,
 } from "./github.js";
@@ -132,8 +133,13 @@ export async function refreshState(
       };
     }
 
-    const checks = repo ? await getCheckRuns(run, repoRoot, repo, pr, signal) : [];
-    const reviewComments = repo ? await getReviewComments(run, repoRoot, repo, pr, signal, 20) : [];
+    const [workflowRuns, reviewComments] = repo
+      ? await Promise.all([
+          getWorkflowRuns(run, repoRoot, repo, pr, signal),
+          getReviewComments(run, repoRoot, repo, pr, signal, 20),
+        ])
+      : [[], []];
+    const checks = repo ? await getCheckRuns(run, repoRoot, repo, pr, workflowRuns, signal) : [];
 
     return {
       ...current,

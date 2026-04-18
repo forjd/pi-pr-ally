@@ -27,6 +27,8 @@ const REVIEW_COMMENTS_PARAMS = Type.Object({
 });
 
 const CHECK_LOG_PARAMS = Type.Object({
+  checkName: Type.Optional(Type.String({ description: "Check name to match, such as a failing GitHub Actions job" })),
+  jobId: Type.Optional(Type.Number({ description: "Workflow job ID to inspect directly" })),
   name: Type.Optional(Type.String({ description: "Workflow run name to match" })),
   runId: Type.Optional(Type.Number({ description: "Workflow run ID to inspect" })),
 });
@@ -98,6 +100,44 @@ export default function prAllyExtension(pi: ExtensionAPI) {
     return state;
   }
 
+  async function getFormattedCheckLog(
+    params: { checkName?: string; jobId?: number; name?: string; runId?: number },
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<{ text: string; details: Record<string, unknown> }> {
+    const current = await ensureFresh(ctx);
+    if (!current.repo || !current.pr) {
+      return {
+        text: formatPrSummary(current),
+        details: {},
+      };
+    }
+
+    const result = await getCheckLog(run, sessionCwd, current.repo, current.pr, current.checks, params, signal ?? ctx.signal);
+    const truncated = await truncateLogOutput(result.text);
+    const headingLines = [
+      result.workflowRunName
+        ? `Workflow: ${result.workflowRunName}`
+        : result.workflowRunId !== undefined
+          ? `Workflow run: ${result.workflowRunId}`
+          : undefined,
+      result.jobName ? `Job: ${result.jobName}` : result.jobId !== undefined ? `Job: ${result.jobId}` : undefined,
+    ].filter(Boolean);
+    const heading = headingLines.length > 0 ? `${headingLines.join("\n")}\n\n` : "";
+
+    return {
+      text: `${heading}${truncated.text}`,
+      details: {
+        check: result.check,
+        workflowRunId: result.workflowRunId,
+        workflowRunName: result.workflowRunName,
+        jobId: result.jobId,
+        jobName: result.jobName,
+        fullOutputPath: truncated.fullOutputPath,
+      },
+    };
+  }
+
   function postPanel(title: string, body: string): void {
     pi.sendMessage({
       customType: "pr-ally",
@@ -163,6 +203,21 @@ export default function prAllyExtension(pi: ExtensionAPI) {
       const current = await ensureFresh(ctx);
       const body = current.pr ? formatChecksSummary(current.checks) : formatPrSummary(current);
       postPanel("PR Checks", body);
+    },
+  });
+
+  pi.registerCommand("check-log", {
+    description: "Fetch a check log by check name, or a workflow log by run ID",
+    handler: async (args, ctx) => {
+      const input = args.trim();
+      if (!input) {
+        ctx.ui.notify("Usage: /check-log <check name or run id>", "warning");
+        return;
+      }
+
+      const params = /^\d+$/.test(input) ? { runId: Number(input) } : { checkName: input };
+      const result = await getFormattedCheckLog(params, ctx);
+      postPanel("Check Log", result.text);
     },
   });
 
@@ -243,11 +298,16 @@ export default function prAllyExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const current = await ensureFresh(ctx);
       const checks = params.onlyFailing
-        ? current.checks.filter((check) => check.conclusion === "failure" || check.conclusion === "timed_out")
+        ? current.checks.filter(
+            (check) =>
+              check.conclusion === "failure" || check.conclusion === "timed_out" || check.conclusion === "cancelled",
+          )
         : current.checks;
 
       return {
-        content: [{ type: "text", text: current.pr ? formatChecksSummary(checks) : formatPrSummary(current) }],
+        content: [
+          { type: "text", text: current.pr ? formatChecksSummary(checks, params.onlyFailing ?? false) : formatPrSummary(current) },
+        ],
         details: {
           checks,
           onlyFailing: params.onlyFailing ?? false,
@@ -287,36 +347,28 @@ export default function prAllyExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "pr_check_log",
     label: "PR Check Log",
-    description: `Fetch a workflow run log for the current PR. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
-    promptSnippet: "Fetch and inspect workflow logs for the current PR",
+    description: `Fetch a workflow or job log for the current PR. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
+    promptSnippet: "Fetch and inspect workflow or job logs for the current PR",
     promptGuidelines: [
       "Use this tool after identifying a failing workflow run or when the user asks for CI logs.",
-      "Prefer passing runId when available; otherwise use a workflow name.",
+      "Prefer passing jobId or checkName for a specific failed check. Otherwise use runId or a workflow name.",
     ],
     parameters: CHECK_LOG_PARAMS,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (params.runId === undefined && !params.name?.trim()) {
-        throw new Error("Provide either runId or name.");
+      if (
+        params.jobId === undefined &&
+        params.runId === undefined &&
+        !params.checkName?.trim() &&
+        !params.name?.trim()
+      ) {
+        throw new Error("Provide one of jobId, checkName, runId, or name.");
       }
 
-      const current = await ensureFresh(ctx);
-      if (!current.repo || !current.pr) {
-        return {
-          content: [{ type: "text", text: formatPrSummary(current) }],
-          details: {},
-        };
-      }
-
-      const result = await getCheckLog(run, sessionCwd, current.repo, current.pr, params, signal ?? ctx.signal);
-      const truncated = await truncateLogOutput(result.text);
-      const heading = result.run ? `Workflow: ${result.run.name}\n\n` : "";
+      const result = await getFormattedCheckLog(params, ctx, signal);
 
       return {
-        content: [{ type: "text", text: `${heading}${truncated.text}` }],
-        details: {
-          run: result.run,
-          fullOutputPath: truncated.fullOutputPath,
-        },
+        content: [{ type: "text", text: result.text }],
+        details: result.details,
       };
     },
   });

@@ -10,6 +10,25 @@ function formatTimestamp(value?: string | number): string {
   return date.toLocaleString();
 }
 
+function isFailingCheck(check: CheckSummary): boolean {
+  return check.conclusion === "failure" || check.conclusion === "timed_out" || check.conclusion === "cancelled";
+}
+
+function hasCheckLogTarget(check: CheckSummary): boolean {
+  return check.jobId !== undefined || check.workflowRunId !== undefined;
+}
+
+function checkSortRank(check: CheckSummary): number {
+  if (isFailingCheck(check)) return 0;
+  if (check.status !== "completed") return 1;
+  if (check.conclusion === "success") return 2;
+  return 3;
+}
+
+function formatCheckLogCommand(check: CheckSummary): string {
+  return `/check-log ${JSON.stringify(check.name)}`;
+}
+
 function summarizeChecks(checks: CheckSummary[]): { failing: number; passing: number; pending: number; other: number } {
   let failing = 0;
   let passing = 0;
@@ -27,7 +46,7 @@ function summarizeChecks(checks: CheckSummary[]): { failing: number; passing: nu
       continue;
     }
 
-    if (check.conclusion === "failure" || check.conclusion === "timed_out" || check.conclusion === "cancelled") {
+    if (isFailingCheck(check)) {
       failing += 1;
       continue;
     }
@@ -113,14 +132,15 @@ export function formatPrSummary(state: PrState): string {
 
 export function formatChecksSummary(checks: CheckSummary[], onlyFailing = false): string {
   const sorted = [...checks].sort((left, right) => {
-    const leftFail = left.conclusion === "failure" ? 0 : 1;
-    const rightFail = right.conclusion === "failure" ? 0 : 1;
-    return leftFail - rightFail;
+    const rank = checkSortRank(left) - checkSortRank(right);
+    if (rank !== 0) return rank;
+
+    const leftTimestamp = left.completedAt ? Date.parse(left.completedAt) : left.startedAt ? Date.parse(left.startedAt) : 0;
+    const rightTimestamp = right.completedAt ? Date.parse(right.completedAt) : right.startedAt ? Date.parse(right.startedAt) : 0;
+    return rightTimestamp - leftTimestamp;
   });
 
-  const filtered = onlyFailing
-    ? sorted.filter((check) => check.conclusion === "failure" || check.conclusion === "timed_out")
-    : sorted;
+  const filtered = onlyFailing ? sorted.filter((check) => isFailingCheck(check)) : sorted;
 
   if (filtered.length === 0) {
     return onlyFailing ? "No failing checks found." : "No checks found for the current PR.";
@@ -128,9 +148,23 @@ export function formatChecksSummary(checks: CheckSummary[], onlyFailing = false)
 
   const lines = filtered.map((check) => {
     const outcome = check.status === "completed" ? check.conclusion ?? "completed" : check.status;
-    const suffix = check.detailsUrl ? ` — ${check.detailsUrl}` : "";
-    return `- ${check.name} [${outcome}]${suffix}`;
+    const hints: string[] = [];
+
+    if (check.workflowRunName && check.workflowRunName !== check.name) {
+      hints.push(`workflow: ${check.workflowRunName}`);
+    }
+
+    if (hasCheckLogTarget(check)) {
+      hints.push(`log: ${formatCheckLogCommand(check)}`);
+    }
+
+    const suffix = [hints.join(" · "), check.detailsUrl].filter(Boolean).join(" — ");
+    return suffix ? `- ${check.name} [${outcome}] — ${suffix}` : `- ${check.name} [${outcome}]`;
   });
+
+  if (filtered.some((check) => hasCheckLogTarget(check))) {
+    lines.push("", 'Tip: run /check-log "<check name>" to fetch a GitHub Actions log for a check.');
+  }
 
   return lines.join("\n");
 }
@@ -147,10 +181,7 @@ export function formatReviewCommentsSummary(comments: ReviewCommentSummary[], li
 export function formatInjectedContext(state: PrState): string | undefined {
   if (!state.enabled || !state.pr) return undefined;
 
-  const failingChecks = state.checks
-    .filter((check) => check.conclusion === "failure" || check.conclusion === "timed_out")
-    .slice(0, 5)
-    .map((check) => check.name);
+  const failingChecks = state.checks.filter((check) => isFailingCheck(check)).slice(0, 5).map((check) => check.name);
 
   const recentComments = state.reviewComments.slice(0, 3).map((comment) => formatComment(comment));
 

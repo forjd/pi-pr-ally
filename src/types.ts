@@ -24,6 +24,9 @@ export interface CheckSummary {
   conclusion?: string | null;
   detailsUrl?: string;
   workflowName?: string;
+  workflowRunId?: number;
+  workflowRunName?: string;
+  jobId?: number;
   appName?: string;
   startedAt?: string;
   completedAt?: string;

@@ -62,6 +62,22 @@ interface GhReviewCommentResponse {
   };
 }
 
+interface CheckLogRequest {
+  checkName?: string;
+  jobId?: number;
+  name?: string;
+  runId?: number;
+}
+
+interface CheckLogResult {
+  text: string;
+  check?: CheckSummary;
+  workflowRunId?: number;
+  workflowRunName?: string;
+  jobId?: number;
+  jobName?: string;
+}
+
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -69,6 +85,131 @@ function errorText(error: unknown): string {
 
 function looksLikeNoPrError(message: string): boolean {
   return /no pull requests? found|could not find.*pull request/i.test(message);
+}
+
+function normalizeForMatch(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isFailingCheck(check: CheckSummary): boolean {
+  return check.conclusion === "failure" || check.conclusion === "timed_out" || check.conclusion === "cancelled";
+}
+
+function hasLogTarget(check: CheckSummary): boolean {
+  return check.jobId !== undefined || check.workflowRunId !== undefined;
+}
+
+function matchNameScore(candidate: string, query: string): number | undefined {
+  const normalizedCandidate = normalizeForMatch(candidate);
+  if (normalizedCandidate === query) return 0;
+  if (normalizedCandidate.startsWith(query)) return 1;
+  if (normalizedCandidate.includes(query)) return 2;
+  return undefined;
+}
+
+function findCheckByName(checks: CheckSummary[], rawQuery: string): CheckSummary | undefined {
+  const query = normalizeForMatch(rawQuery);
+  if (!query) return undefined;
+
+  return checks
+    .map((check) => ({
+      check,
+      score: matchNameScore(check.name, query),
+      timestamp: check.completedAt ? Date.parse(check.completedAt) : check.startedAt ? Date.parse(check.startedAt) : 0,
+    }))
+    .filter((item): item is { check: CheckSummary; score: number; timestamp: number } => item.score !== undefined)
+    .sort((left, right) => {
+      if (left.score !== right.score) return left.score - right.score;
+      if (hasLogTarget(left.check) !== hasLogTarget(right.check)) return hasLogTarget(left.check) ? -1 : 1;
+      if (isFailingCheck(left.check) !== isFailingCheck(right.check)) return isFailingCheck(left.check) ? -1 : 1;
+      return right.timestamp - left.timestamp;
+    })
+    .at(0)?.check;
+}
+
+function formatAvailableNames(values: string[]): string {
+  return [...new Set(values.filter(Boolean))].slice(0, 8).join(", ");
+}
+
+function parseActionsLogTarget(url?: string): { workflowRunId?: number; jobId?: number } {
+  if (!url) return {};
+
+  const jobMatch =
+    url.match(/\/actions\/runs\/(\d+)\/job\/(\d+)(?:[/?#]|$)/i) ??
+    url.match(/\/runs\/(\d+)\/job\/(\d+)(?:[/?#]|$)/i);
+  if (jobMatch) {
+    return {
+      workflowRunId: Number(jobMatch[1]),
+      jobId: Number(jobMatch[2]),
+    };
+  }
+
+  const runMatch = url.match(/\/actions\/runs\/(\d+)(?:[/?#]|$)/i) ?? url.match(/\/runs\/(\d+)(?:[/?#]|$)/i);
+  if (runMatch) {
+    return {
+      workflowRunId: Number(runMatch[1]),
+    };
+  }
+
+  return {};
+}
+
+async function getWorkflowLogByRunId(
+  run: ExecLike,
+  cwd: string,
+  runId: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  return execText(run, "gh", ["run", "view", String(runId), "--log"], {
+    cwd,
+    signal,
+    timeout: 60000,
+  });
+}
+
+async function getWorkflowLogByJobId(
+  run: ExecLike,
+  cwd: string,
+  jobId: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  return execText(run, "gh", ["run", "view", "--job", String(jobId), "--log"], {
+    cwd,
+    signal,
+    timeout: 60000,
+  });
+}
+
+async function getLogForCheck(
+  run: ExecLike,
+  cwd: string,
+  check: CheckSummary,
+  signal?: AbortSignal,
+): Promise<CheckLogResult> {
+  if (check.jobId !== undefined) {
+    const text = await getWorkflowLogByJobId(run, cwd, check.jobId, signal);
+    return {
+      text,
+      check,
+      workflowRunId: check.workflowRunId,
+      workflowRunName: check.workflowRunName,
+      jobId: check.jobId,
+      jobName: check.name,
+    };
+  }
+
+  if (check.workflowRunId !== undefined) {
+    const text = await getWorkflowLogByRunId(run, cwd, check.workflowRunId, signal);
+    return {
+      text,
+      check,
+      workflowRunId: check.workflowRunId,
+      workflowRunName: check.workflowRunName,
+    };
+  }
+
+  const suffix = check.detailsUrl ? ` Open the check details instead: ${check.detailsUrl}` : "";
+  throw new Error(`Check "${check.name}" is not linked to a GitHub Actions log.${suffix}`);
 }
 
 export async function hasGhCli(run: ExecLike, cwd: string, signal?: AbortSignal): Promise<boolean> {
@@ -135,6 +276,7 @@ export async function getCheckRuns(
   cwd: string,
   repo: RepoSlug,
   pr: PrSummary,
+  workflowRuns: WorkflowRunSummary[] = [],
   signal?: AbortSignal,
 ): Promise<CheckSummary[]> {
   if (!pr.headSha) return [];
@@ -146,16 +288,28 @@ export async function getCheckRuns(
     { cwd, signal, timeout: 20000 },
   );
 
-  return (response.check_runs ?? []).map((check) => ({
-    id: check.id,
-    name: check.name,
-    status: check.status,
-    conclusion: check.conclusion,
-    detailsUrl: check.html_url ?? check.details_url,
-    appName: check.app?.name,
-    startedAt: check.started_at,
-    completedAt: check.completed_at,
-  }));
+  const workflowRunsById = new Map(workflowRuns.map((runItem) => [runItem.id, runItem]));
+
+  return (response.check_runs ?? []).map((check) => {
+    const detailsUrl = check.html_url ?? check.details_url;
+    const target = parseActionsLogTarget(detailsUrl);
+    const workflowRun = target.workflowRunId ? workflowRunsById.get(target.workflowRunId) : undefined;
+    const isGitHubActions = check.app?.name === "GitHub Actions";
+
+    return {
+      id: check.id,
+      name: check.name,
+      status: check.status,
+      conclusion: check.conclusion,
+      detailsUrl,
+      workflowRunId: target.workflowRunId,
+      workflowRunName: workflowRun?.name,
+      jobId: target.jobId ?? (isGitHubActions ? check.id : undefined),
+      appName: check.app?.name,
+      startedAt: check.started_at,
+      completedAt: check.completed_at,
+    };
+  });
 }
 
 export async function getWorkflowRuns(
@@ -194,41 +348,77 @@ export async function getCheckLog(
   cwd: string,
   repo: RepoSlug,
   pr: PrSummary,
-  options: { name?: string; runId?: number },
+  checks: CheckSummary[],
+  options: CheckLogRequest,
   signal?: AbortSignal,
-): Promise<{ text: string; run?: WorkflowRunSummary }> {
+): Promise<CheckLogResult> {
+  if (options.jobId !== undefined) {
+    const text = await getWorkflowLogByJobId(run, cwd, options.jobId, signal);
+    const matchedCheck = checks.find((check) => check.jobId === options.jobId);
+    return {
+      text,
+      check: matchedCheck,
+      workflowRunId: matchedCheck?.workflowRunId,
+      workflowRunName: matchedCheck?.workflowRunName,
+      jobId: options.jobId,
+      jobName: matchedCheck?.name,
+    };
+  }
+
   if (options.runId !== undefined) {
-    const text = await execText(run, "gh", ["run", "view", String(options.runId), "--log"], {
-      cwd,
-      signal,
-      timeout: 60000,
-    });
-    return { text };
+    const text = await getWorkflowLogByRunId(run, cwd, options.runId, signal);
+    return {
+      text,
+      workflowRunId: options.runId,
+    };
   }
 
-  const query = options.name?.trim().toLowerCase();
+  const checkQuery = options.checkName?.trim();
+  if (checkQuery) {
+    const matchedCheck = findCheckByName(checks, checkQuery);
+    if (!matchedCheck) {
+      const availableChecks = formatAvailableNames(checks.filter(hasLogTarget).map((check) => check.name));
+      const suffix = availableChecks ? ` Available checks: ${availableChecks}` : "";
+      throw new Error(`No check found for "${options.checkName}".${suffix}`);
+    }
+
+    return getLogForCheck(run, cwd, matchedCheck, signal);
+  }
+
+  const query = options.name?.trim();
   if (!query) {
-    throw new Error("Provide either runId or name when requesting a check log.");
+    throw new Error("Provide one of jobId, checkName, runId, or name.");
   }
 
+  const normalizedQuery = normalizeForMatch(query);
   const workflowRuns = await getWorkflowRuns(run, cwd, repo, pr, signal);
-  const match =
-    workflowRuns.find((item) => item.name.toLowerCase() === query) ??
-    workflowRuns.find((item) => item.name.toLowerCase().includes(query));
+  const matchedRun =
+    workflowRuns.find((item) => normalizeForMatch(item.name) === normalizedQuery) ??
+    workflowRuns.find((item) => normalizeForMatch(item.name).includes(normalizedQuery));
 
-  if (!match) {
-    const available = workflowRuns.map((item) => item.name).slice(0, 8);
-    const suffix = available.length > 0 ? ` Available runs: ${available.join(", ")}` : "";
-    throw new Error(`No workflow run found for \"${options.name}\".${suffix}`);
+  if (matchedRun) {
+    const text = await getWorkflowLogByRunId(run, cwd, matchedRun.id, signal);
+    return {
+      text,
+      workflowRunId: matchedRun.id,
+      workflowRunName: matchedRun.name,
+    };
   }
 
-  const text = await execText(run, "gh", ["run", "view", String(match.id), "--log"], {
-    cwd,
-    signal,
-    timeout: 60000,
-  });
+  const matchedCheck = findCheckByName(checks, query);
+  if (matchedCheck) {
+    return getLogForCheck(run, cwd, matchedCheck, signal);
+  }
 
-  return { text, run: match };
+  const availableRuns = formatAvailableNames(workflowRuns.map((item) => item.name));
+  const availableChecks = formatAvailableNames(checks.filter(hasLogTarget).map((check) => check.name));
+  const suffixParts = [
+    availableRuns ? `Available runs: ${availableRuns}` : undefined,
+    availableChecks ? `Available checks: ${availableChecks}` : undefined,
+  ].filter(Boolean);
+  const suffix = suffixParts.length > 0 ? ` ${suffixParts.join(" ")}` : "";
+
+  throw new Error(`No workflow run or check log found for "${options.name}".${suffix}`);
 }
 
 export async function getReviewComments(
